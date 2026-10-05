@@ -1,0 +1,662 @@
+============================================================
+PAGE 1 — SQL SEARCH FILTER BUG
+============================================================
+
+Project: Superrdev Patch Exercise
+Area: Backend — TaskRepository.java
+
+TITLE:
+Incorrect SQL AND / OR Operator Precedence
+
+1. ISSUE IDENTIFIED
+
+The task search API was returning incorrect results for some
+combinations of search keyword, status, and archived state.
+
+The repository query was responsible for searching tasks by their
+title or description while also filtering tasks based on their
+status and archived state.
+
+The problem was that the SQL query used both AND and OR operators
+without explicitly grouping the title and description conditions.
+
+The original query was logically similar to:
+
+WHERE archived = FALSE
+AND title LIKE searchTerm
+OR description LIKE searchTerm
+AND status = selectedStatus
+
+At first glance this looks correct, but SQL does not evaluate
+AND and OR from left to right.
+
+SQL gives AND higher precedence than OR.
+
+Therefore the database can interpret the query approximately as:
+
+(
+    archived = FALSE
+    AND title matches search
+)
+OR
+(
+    description matches search
+    AND status matches
+)
+
+This is different from the intended business logic.
+
+2. HOW I FOUND THE ISSUE
+
+I inspected the SQL query in TaskRepository.java and checked how
+the AND and OR conditions were combined.
+
+I then considered combinations where:
+
+- The keyword matches the title.
+- The keyword matches the description.
+- The task has the requested status.
+- The task is archived.
+
+This showed that the filters were not guaranteed to apply to the
+complete title-or-description search condition.
+
+3. ROOT CAUSE
+
+The root cause was missing parentheses around the OR condition.
+
+The application intended the following logic:
+
+Archived must be false
+
+AND
+
+Title OR description must contain the search term
+
+AND
+
+Status must match the selected status, if one was supplied.
+
+4. WHAT I CHANGED
+
+I changed the query so that the title and description conditions
+are explicitly grouped:
+
+WHERE archived = FALSE
+AND (
+    LOWER(title) LIKE :term
+    OR LOWER(description) LIKE :term
+)
+AND (
+    :status IS NULL
+    OR status = :status
+)
+
+The parentheses make the intended logical structure explicit.
+
+5. WHY I MADE THIS CHANGE
+
+This ensures that every returned task satisfies all required
+conditions.
+
+A task must:
+
+1. Not be archived.
+2. Match the search term in either title or description.
+3. Match the selected status when a status filter is provided.
+
+This prevents incorrect records from appearing in search results.
+
+6. BENEFIT
+
+The change improves correctness rather than just changing the
+appearance of the application.
+
+It also makes the SQL easier for another developer to understand
+because the intended business logic is explicitly represented.
+
+7. TESTING
+
+I would test the following combinations:
+
+- Search without status.
+- Search with OPEN status.
+- Search with DONE status.
+- Search for a term that appears only in the description.
+- Search for a term belonging to an archived task.
+
+The expected result is that archived tasks never appear and the
+status filter always applies correctly.
+
+
+============================================================
+PAGE 2 — BACKEND VALIDATION AND PERFORMANCE
+============================================================
+
+Project: Superrdev Patch Exercise
+Area: Backend — TaskController.java
+
+TITLE:
+Input Validation and Removal of Artificial Request Delay
+
+PART A — INVALID PAGINATION INPUT
+
+1. ISSUE IDENTIFIED
+
+The API accepted page and pageSize values directly from the client
+without validating them.
+
+For example, a client could send:
+
+page = 0
+
+or:
+
+page = -1
+
+or:
+
+pageSize = 0
+
+or even an extremely large pageSize.
+
+The controller later used these values to calculate the starting
+position of a page.
+
+The calculation was similar to:
+
+start = (page - 1) * pageSize
+
+Invalid values can therefore produce invalid indexes or unexpected
+behavior.
+
+2. HOW I FOUND IT
+
+I traced the pagination calculation in the controller and noticed
+that the API trusted user-provided query parameters.
+
+I tested the logic with boundary values such as:
+
+page = 0
+page = -1
+pageSize = 0
+
+These values do not represent valid pagination requests.
+
+3. WHAT I CHANGED
+
+I added validation before performing the database operation.
+
+The API now requires:
+
+page >= 1
+
+pageSize >= 1
+
+pageSize <= 100
+
+Invalid values return HTTP 400 Bad Request with an explanatory
+error message.
+
+4. WHY
+
+Client input should never be assumed to be valid.
+
+Validation at the API boundary prevents invalid data from reaching
+the pagination logic and gives the client a predictable response.
+
+I also added a maximum page size of 100 to prevent a client from
+requesting an unnecessarily large number of records.
+
+------------------------------------------------------------
+
+PART B — INVALID STATUS VALUE
+
+1. ISSUE IDENTIFIED
+
+The status parameter was converted to the TaskStatus enum using
+valueOf().
+
+If an unsupported value was supplied, valueOf() could throw an
+IllegalArgumentException.
+
+For example:
+
+status=INVALID
+
+is not a valid task status.
+
+2. HOW I FOUND IT
+
+I followed the status parsing code and identified that enum
+conversion can throw an exception for unsupported input.
+
+3. WHAT I CHANGED
+
+I wrapped the enum conversion in validation logic.
+
+If the status is invalid, the API now returns HTTP 400 instead of
+allowing the exception to propagate unexpectedly.
+
+4. WHY
+
+Invalid client input should result in a controlled client error,
+not an unexpected server-side exception.
+
+------------------------------------------------------------
+
+PART C — ARTIFICIAL THREAD DELAY
+
+1. ISSUE IDENTIFIED
+
+The controller contained Thread.sleep() based on the search query.
+
+This intentionally delayed API requests.
+
+For shorter search terms, the delay could become significant.
+
+2. HOW I FOUND IT
+
+While reviewing the request execution flow, I found that the
+controller calculated a complexity score and then called
+Thread.sleep() before executing the actual search.
+
+3. WHAT I CHANGED
+
+I completely removed the artificial delay and the unused
+complexity calculation.
+
+4. WHY
+
+A web request should not intentionally block a server thread when
+there is no functional reason to do so.
+
+Thread.sleep():
+
+- Increases response time.
+- Occupies a server thread.
+- Reduces throughput.
+- Becomes more problematic when multiple users make requests.
+
+Removing the artificial delay makes the API respond as soon as the
+actual database operation is completed.
+
+5. BENEFIT
+
+The change improves API performance and scalability without
+changing the expected business behavior of the application.
+
+
+============================================================
+PAGE 3 — FRONTEND ASYNCHRONOUS REQUEST RACE CONDITION
+============================================================
+
+Project: Superrdev Patch Exercise
+Area: Frontend — api.js and useTasks.js
+
+TITLE:
+Preventing Stale Search Results
+
+1. ISSUE IDENTIFIED
+
+The frontend performs API requests whenever the search text,
+status filter, or pagination changes.
+
+If the user types quickly, multiple API requests can be running
+at the same time.
+
+For example:
+
+Request 1:
+Search = "a"
+
+Request 2:
+Search = "ap"
+
+Request 3:
+Search = "api"
+
+The user ultimately wants the result for "api".
+
+However, network requests do not necessarily finish in the same
+order in which they were created.
+
+For example:
+
+Request 3 may finish first.
+
+Request 1 may finish last.
+
+If the frontend accepts every response without checking whether
+the request is still relevant, the old "a" response can overwrite
+the newer "api" results.
+
+This is an asynchronous race condition.
+
+2. HOW I FOUND IT
+
+I inspected the useTasks React hook and noticed that every change
+to the search or filter triggered a new fetch request.
+
+There was no cancellation of the previous request.
+
+I then considered what would happen if a user typed several
+characters quickly while previous requests were still running.
+
+This revealed that an older response could update the React state
+after a newer request had already started.
+
+3. ROOT CAUSE
+
+The frontend treated every API response as current.
+
+It did not distinguish between:
+
+- The latest request.
+- An older request that was still running.
+
+4. WHAT I CHANGED
+
+I added AbortController support.
+
+For every request, the hook creates a controller:
+
+const controller = new AbortController();
+
+The controller's signal is passed to fetch.
+
+When the React effect is cleaned up, the previous request is
+cancelled:
+
+return () => {
+    controller.abort();
+};
+
+This happens when:
+
+- The search value changes.
+- The status changes.
+- The page changes.
+- The component is unmounted.
+
+5. WHY I USED ABORTCONTROLLER
+
+AbortController is a browser-supported mechanism for cancelling
+fetch requests.
+
+It prevents unnecessary network work and, more importantly, avoids
+allowing obsolete requests to continue competing with the latest
+request.
+
+6. HANDLING ABORT ERRORS
+
+Cancelling a request is expected behavior when the user changes
+the search quickly.
+
+Therefore the code checks:
+
+if (err.name !== 'AbortError')
+
+Only genuine request errors are shown to the user.
+
+An expected cancellation is not displayed as an application error.
+
+7. EXAMPLE
+
+Without cancellation:
+
+User types:
+
+a
+↓
+Request A starts
+
+ap
+↓
+Request B starts
+
+api
+↓
+Request C starts
+
+Possible completion order:
+
+C → B → A
+
+If A updates the UI last, the user sees results for "a" even
+though the search box contains "api".
+
+With cancellation:
+
+a
+↓
+Request A
+
+ap
+↓
+Request A cancelled
+Request B
+
+api
+↓
+Request B cancelled
+Request C
+
+Only the current request remains active.
+
+8. BENEFIT
+
+This makes the search interface more reliable and prevents stale
+data from replacing the user's latest results.
+
+
+============================================================
+PAGE 4 — LOADING, ERROR, PAGINATION AND UX IMPROVEMENTS
+============================================================
+
+Project: Superrdev Patch Exercise
+Area: React UI and Task State Management
+
+TITLE:
+Improving Loading, Error and Pagination Behavior
+
+PART A — LOADING STATE
+
+1. ISSUE IDENTIFIED
+
+The frontend maintained a loading state while the API request was
+running.
+
+However, when a request failed, the loading state was not always
+reset correctly.
+
+This could leave the interface appearing to load indefinitely.
+
+2. HOW I FOUND IT
+
+I followed both execution paths:
+
+Successful request:
+request → success → update data
+
+Failed request:
+request → error → update error
+
+The error path did not guarantee that loading would be reset.
+
+3. WHAT I CHANGED
+
+I used a finally block:
+
+finally {
+    setLoading(false);
+}
+
+The finally block runs whether the request succeeds or fails.
+
+4. WHY
+
+The loading indicator represents the current state of the request.
+
+Once the request finishes, either successfully or unsuccessfully,
+loading must become false.
+
+This prevents the UI from becoming stuck.
+
+------------------------------------------------------------
+
+PART B — CLEARING OLD ERROR MESSAGES
+
+1. ISSUE IDENTIFIED
+
+If one API request failed, its error could remain visible when a
+new request started.
+
+For example:
+
+First request:
+Network error
+
+Second request:
+Successful request
+
+The old error should not remain visible after the successful
+request.
+
+2. WHAT I CHANGED
+
+At the beginning of every new request I reset the error:
+
+setError(null);
+
+3. WHY
+
+The error state should describe the current request, not an older
+request.
+
+This gives the user accurate feedback.
+
+------------------------------------------------------------
+
+PART C — RESETTING PAGINATION AFTER FILTERING
+
+1. ISSUE IDENTIFIED
+
+A user could be viewing a later page and then change the search
+term or status filter.
+
+For example:
+
+Page 4 of 4
+
+Then the user selects:
+
+DONE
+
+Suppose only one page of DONE tasks exists.
+
+The application could still be requesting page 4.
+
+This could incorrectly appear as if there are no matching tasks.
+
+2. HOW I FOUND IT
+
+I tested the relationship between:
+
+- Current page.
+- Search value.
+- Status filter.
+- Total number of results.
+
+The current page belongs to the previous result set, so it is not
+always valid for the new filtered result set.
+
+3. WHAT I CHANGED
+
+Whenever the search query or status changes, I reset the page:
+
+setPage(1);
+
+4. WHY
+
+A new search or filter represents a new result set.
+
+Starting from page 1 is the expected behavior and prevents invalid
+pagination states.
+
+------------------------------------------------------------
+
+PART D — PROTECTING AGAINST AN INVALID CURRENT PAGE
+
+1. ISSUE IDENTIFIED
+
+Even if the user does not change the filter, the total number of
+results can decrease.
+
+For example:
+
+Current page = 3
+
+Total pages = 2
+
+Page 3 no longer exists.
+
+2. WHAT I CHANGED
+
+I calculate total pages from the total result count.
+
+If:
+
+current page > total pages
+
+the application moves the user to the last valid page.
+
+3. WHY
+
+The frontend should not request or display a page that no longer
+exists.
+
+This keeps pagination consistent with the actual data.
+
+------------------------------------------------------------
+
+PART E — ACCESSIBILITY IMPROVEMENTS
+
+I also made small accessibility improvements.
+
+The search input now has an appropriate search type and an
+accessible label.
+
+The status filter has an accessible label.
+
+The loading message uses a status role.
+
+The error message uses an alert role.
+
+These changes do not alter the application's business logic.
+
+They help users who rely on assistive technologies understand
+changes in the interface.
+
+------------------------------------------------------------
+
+FINAL SUMMARY
+
+The modifications were focused on correctness, reliability,
+performance and user experience.
+
+The highest-priority fix was the SQL operator-precedence problem
+because it could return incorrect task data.
+
+The main backend performance improvement was removing the
+artificial Thread.sleep() delay.
+
+The main frontend reliability improvement was preventing stale
+asynchronous responses using AbortController.
+
+The pagination and loading-state changes prevent confusing UI
+behavior.
+
+I intentionally avoided unnecessary redesigns and new dependencies
+because the objective was to fix high-value problems while keeping
+the application simple and maintainable.
